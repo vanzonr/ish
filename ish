@@ -1,0 +1,2046 @@
+#!/bin/bash 
+#
+# ish - Inventory shell to browse folders, tarball content, ..., from
+#       local index files; written in bash.
+#
+# Copyright (c)  2011-2014  Ramses van Zon
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions;
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+############################################################################
+#        FILE: ish
+#      AUTHOR: Ramses van Zon
+# AFFILIATION: SciNet/Toronto/Canada
+#     CREATED: June 8, 2011
+#     VERSION: 0.997
+#    MODIFIED: Apr 8, 2014
+#     PURPOSE: Browse folders, tarball content, ... from local index files.
+#       USAGE: See the functions ish_usage and command_help below.
+############################################################################
+
+# INITIALIZE ANY AND ALL GLOBAL CONSTANTS AND VARIABLES
+
+trap "echo 'Ish interrupted before finished';exit 129" INT TERM
+
+readonly ISH_SYNTAX=64  # syntax errors are errors (become warnings if 0)
+readonly ISH_SEP=@@@@@  # magic mark in index file between file name and meta
+readonly HSI=hsi        # the name of the hsi command
+readonly HTAR=htar      # the name of the htar command
+readonly ZGREP=zgrep    # the name of the zgrep command
+readonly ISH_HTARSIZELIMIT=68719476735      # maximum file size for htar
+readonly ISH_TIMEFORMAT="%Y-%m-%d %H:%M:%S" # format of the date-time stamp
+declare -a ISH_IGZSTACK # stack of igz files opened before
+ISH="$0" # program's name, will be corrected just before main is called
+ISH_STACK=0     # at the beginning of the stack
+ISH_PWD="./"    # current directory in the index file; ./ is the 'root'
+ISH_FILE=       # current index file
+ISH_ABS=false   # true if the index file true absolute paths
+ISH_BEGIN=      # depending, the begin-of-filename marker
+ISH_LONG=false  # when true, use long listing
+ISH_COLOUR=true # when true, use ish_colourize
+ISH_OLDFOLDER=  # previous "foldername"
+ISH_RECUR=false # true when doing a recursive ls
+ISH_FIND=false  # true in "find" mode
+ISH_COLUMN=cat  # default assumes no column command (set later, just before main)
+ISH_DRY=false   # dry run, don't actually do any commands, but script them
+ISH_SCRIPT=     # where to store script (if "" it's not in script mode)
+ISH_COMMENT=    # pass a comment to put in the igz header
+ISH_LAST_SUM=0  # contains last summation in du
+ISH_LAST_NF=0   # contains last summation in du
+ISH_COUNT=0     # contains number of directories traversed
+ISH_SKIP_CXC=false # if true, the connexion check is skipped (may cause danglers)
+ISH_DEBUG=false # prints debug messages to stderr
+ISH_STAGE=0     # some ish commands can be split up in stages. STAGE=0 means all stages.
+ISH_REG="~/.ish_register" # default puts indices in ~/.ish_register
+
+function stderr() {
+    echo $@ 1>&2
+}
+
+function ish_extract() {
+    # Extract a field from this scripts descriptive header
+    #   $1 = field (FILE/AUTHOR/AFFILICATION/CREATED/MODIFIED/PURPOSE/USAGE)
+    grep "${1:-}\:" $ISH|cut -c 16- 2>/dev/null
+    return 0  # never mind any error
+}
+
+function ish_top_help() {
+    # Auxiliary to displace the header of a commands help page
+    echo
+    echo "$1 - ish command to $3"
+    echo
+    echo "Usage"
+    echo "    $1 $2"
+    echo
+}
+
+function ish_usage() {
+# What you get when you type "ish --help"
+cat <<EOF
+$ISH - inventory shell
+
+$(ish_extract PURPOSE)
+
+$(ish_extract AUTHOR) - $(ish_extract AFFILIATION)/$(ish_extract MODIFIED)
+
+Usage
+    ish -h|--help                      show this help
+    ish --version                      show version number
+    ish [INDEX]                        interactive shell for file INDEX
+    ish [INDEX] COMMAND                perform single COMMAND on file INDEX
+
+    When INDEX is omitted, hpss.igz is loaded if available.
+$(command_help)
+
+Command line examples
+
+  Local tar and gzip directory 'code': ish tar -z code.tgz code
+  Long list of its content:            ish code.tgz.igz ls -l 'code/*'
+  Make index file for existing tar:    ish index another.tar
+  List its top level content:          ish another.tar.igz ls
+  List all of its content:             ish another.tar.igz ls -r
+  Find file 'hello.txt' in it:         ish another.tar.igz find hello.txt
+  Make index hspp.igz for hpss tree:   ish hindex
+  Create index file for an htar file:  ish hindex data.tar
+  Create htar and index file:          ish htar -cpf data.tar data/
+
+EOF
+}
+
+function ish_if_exists_rename() {
+    # Check if a file exists already.  If so attempts to rename the
+    # original file NAME.EXT to NAME-date.EXT If this fails, it is
+    # probably read-only, and we'll let something else break, after
+    # printing a warning message
+    if [ -e "$1" ]; then
+        local name=${1%\.*}
+        local ext=${1##*\.}
+        local date=`date -r $1 +'%Y%0m%0d_%0k%0M%0S'`
+        local newfilename="${name}_${date}.${ext}"
+        if mv "$1" "$newfilename"; then
+            echo $newfilename
+        else
+            stderr "Error: Previous $1 could not be renamed to $newfilename" 
+            return 1
+        fi
+    fi
+}
+
+function ish_rot13() {
+    #an extended rot13, used in igz header
+    echo "$@" | tr '[a-m][n-z][A-M][N-Z][0-9]' '[n-z][a-m][N-Z][A-M][9876543210]'
+}
+
+function ish_igz_header() {
+    # Writes a header to the index file in rot13, so zgrepping is
+    # unlikely to find these. $ISH_COMMENT may optionally be set, and
+    # is appended to the CMD field.
+    ish_rot13 "@ISH/VERSION/$(ish_extract VERSION)" 
+    ish_rot13 "@ISH/AUTHOR/$(ish_extract AUTHOR)"
+    ish_rot13 "@ISH/PLACE/$(ish_extract AFFILIATION)"
+    ish_rot13 "@ISH/DATE/$(ish_extract MODIFIED)"
+    ish_rot13 "@ISH/TIME/`date -r $ISH +'%k:%M:%S'`"
+    ish_rot13 "@ISH/NAME/$(basename $idxfile)"
+    ish_rot13 "@ISH/USER/$USER"
+    ish_rot13 "@ISH/PWD/${PWD//\//&}"
+    ish_rot13 "@ISH/HOST/$(uname -n)"
+    ish_rot13 "@ISH/DATESTAMP/`date +'%d-%m-%Y %k:%M:%S'`"
+    ish_rot13 "@ISH/CMD/${@//\//&} ${ISH_COMMENT:-}"
+    return 0 # don't care for errors 
+}
+
+function ish_create_igz() {
+    # Creates a standardized .igz file (ish versions > 0.9)
+    #  $1    index file
+    #  $2    uncompressed list, but possibly with meta data appended
+    #  $3... commands by which the igz was generated
+    local idxfile="$1"
+    local oldidxfile="$(ish_if_exists_rename $idxfile)"
+    local tmp1=$(mktemp)
+    local tmp2="$2"
+    local tmp3=$(mktemp)
+    local status=0
+    local laststatus
+    shift 2
+    ish_igz_header "$@" > $tmp1
+    laststatus=$?
+    if (( $laststatus > $status )); then
+            status=$laststatus
+    fi
+    #the following should be skipped sometimes
+    if ! $ISH_SKIP_CXC; then
+        ish_check_connexions_index "$tmp2" > $tmp3
+    fi
+    laststatus=$?
+    if (( $laststatus > $status )); then
+            status=$laststatus
+    fi
+    cat $tmp1 "$tmp2" $tmp3 | gzip -c > "$idxfile"
+    laststatus=$?
+    if (( $laststatus > $status )); then
+            status=$laststatus
+    fi
+    if $ISH_DEBUG; then
+        ls -l $tmp1 $tmp2
+    fi
+    rm -f $tmp1 $tmp3
+    ish_check_redundancy "$idxfile" "$oldidxfile"
+    laststatus=$?
+    if (( $laststatus > $status )); then
+            status=$laststatus
+    fi
+    return $status
+}
+
+function ish_check_redundancy() {
+    # Check if file $1 and file $2 are the same.
+    # if they are, tries to delete $2
+    if [[ -e "$1" && -e "$2" ]]; then
+        #force zdiff comparison (zdiff treats .igz as noncompressed)
+        ln -sf "$1" "$1.gz"
+        ln -sf "$2" "$2.gz"
+        #^@VFU/ is the rot13 version of ^@ISH/, and should not count
+        zdiff --ignore-matching-lines='^@VFU/'  --ignore-matching-lines='^/tmp/HTAR' "$1.gz" "$2.gz" >&/dev/null
+        local status=$?
+        if $ISH_DEBUG; then
+            ls -l "$1.gz" "$2.gz"
+        fi
+        rm -f "$1.gz" "$2.gz"
+        if [ $status == 0 ]; then
+            # contrary to intuition, zdiff is successful if the files are the same
+            if $ISH_DEBUG; then
+                ls -l "$2"
+            fi
+            rm "$2"
+        else
+            stderr "Warning: Previous $(basename $1) saved as $(basename $2)"
+        fi
+    fi
+}
+
+function ish_err_msg() {
+    # Print error message assuming sysexits.h convention (hsi follows this)
+    #   $1 = exit code, assumed to follow sysexits.h convention
+    local errorno="$1"
+    if [ -n "$1" ]; then
+        if [ -e "$(dirname $ISH)/exit2msg" ]; then
+            if [ -n "${2:-}" ]; then
+                shift 
+                printf "%s" "$*: "
+            fi            
+            $(dirname $ISH)/exit2msg $errorno
+        else
+            if [ -n "${2:-}" ]; then
+                shift 
+                echo "$@: "
+            fi
+            case "$errorno" in
+               0) stderr "Success";;
+               1) stderr "Miscellaneous error";;
+               2) stderr "Misuse of shell builtin";;
+              64) stderr "Command line usage error or general messages";;
+              65) stderr "Data format error";;
+              66) stderr "Cannot open input";;
+              67) stderr "Addressee unknown";;
+              68) stderr "Host name unknown";;
+              69) stderr "Service unavailable";;
+              70) stderr "Internal software error";;
+              71) stderr "Operating system error";;
+              72) stderr "Critical OS file missing (syntax error)";;
+              73) stderr "Cannot create (user) output file";;
+              74) stderr "Input/output error";;
+              75) stderr "Temporary failure (try again)";;
+              76) stderr "Remote error in protocol";;
+              77) stderr "Permission denied";;
+              78) stderr "Configuration error";;
+             126) stderr "Command invoked cannot execute";;
+             127) stderr "Command not found";;
+             128) stderr "Invalid argument to exit";;
+             129) stderr "Fatal error 1";;
+             130) stderr "Script terminated by Ctrl-C";;
+             131) stderr "Fatal error 2";;
+             255) stderr "Exit status out of range";;
+               *) if (( "$errorno" > 128 && "$errorno" < 255 )); then
+                     let errorno="errorno-128"
+                     stderr "Fatal error $errorno" 
+                  else
+                     stderr "Unknown error" 
+                  fi
+                  ;;
+            esac
+    fi
+fi
+}
+
+function ish_normalize_inner() {
+    # Removes ., //, trailing / and .. from a path (can't start with /)
+    #   $1 = path
+    local dir="/$1/" # Less special cases when embedded in slashes
+    # Replace any '/./' or '//' by '/'
+    local old=$dir
+    dir=${dir//\/\.\//\/}
+    dir=${dir//\/\//\/}
+    while [ "$dir" != "$old" ]; do
+        old="$dir"
+        dir=${dir//\/\.\//\/}
+        dir=${dir//\/\//\/}
+    done
+    # Also remove any /. at the end
+    dir=${dir%%/.}
+    # Remove dir/.. sequences.
+    local sequence="([^/][^/]*/\.\./)"
+    while [[ $dir =~ $sequence ]]; do
+        dir=${dir/${BASH_REMATCH[0]}/}
+    done
+    # Also remove any / at the end
+    dir=${dir%%/}
+    # And output without the auxiliary / at the beginning
+    echo "${dir:1}" 
+}
+
+function ish_normalize() {
+    # Removes ., //, trailing / and .. from a path.
+    #  $1 = path
+    # Hack on ish_normalize_inner so it works with absolute paths as well
+    local dir="$1"
+    if [ "${dir:0:1}" == "/" ]; then
+        while [ "${dir:0:1}" == "/" ]; do
+            dir="${dir:1}"
+        done
+        echo "/$(ish_normalize_inner "$dir")"
+    else
+        echo "$(ish_normalize_inner "$dir")"
+    fi
+}
+
+function ish_full_path() {
+    # Replaces initial ~/ by ${HOME} and prepends pwd to relative paths.
+    #   $1 = path
+    # Patch this up to find the real path from symlinks (useful for bgq)
+    local ECHO
+    if which readlink &> /dev/null; then
+	ECHO="readlink -f"
+    else
+	ECHO="echo"
+    fi
+    if [ "${1:0:1}" == "/" ]; then
+        $ECHO "$1"
+    elif [ "${1:0:2}" == "~/" ]; then
+        $ECHO "$HOME${1:1}"
+    elif [ "$1" == "~" ]; then
+        $ECHO "$HOME"
+    else
+        $ECHO "$PWD/$1"
+    fi
+}
+
+function ish_colourize() {
+    # Colourizes the file listing similarly to ls.
+    #   $1 = file containing the listing
+    if $ISH_COLOUR; then
+        $ISH_COLUMN $1 \
+            | expand \
+            | awk '{printf "%s \n",$0;next}' \
+            | sed \
+              --expression='s/\(\S*\)\(\*\)\(\s\)/\o033[01;33m\1\2\o033[0m\3/g' \
+              --expression='s/\(\S*\)\.\(x\|exe\)\(\s\)/\o033[01;33m\1.\2\o033[0m\3/g' \
+              --expression='s/\(\S*\)\(\/\|obj\)\(\s\)/\o033[01;34m\1\2\o033[0m\3/g' \
+              --expression='s/\(\S*\)\(\@\)\(\s\)/\o033[01;36m\1\2\o033[0m\3/g' \
+              --expression='s/\(\S*\)\.\(tar\|tgz\|arj\|taz\|lzh\|zip\|z\|Z\|gz\|bz2\|deb\|rpm\|jar\)\(\s\)/\o033[31;01m\1.\2\o033[0m\3/g' \
+              --expression='s/\(\S*\)\.\(jpg\|jpeg\|gif\|bmp\|pbm\|pgm\|ppm\|tga\|xbm\|xpm\|tif\|tiff\|png\|mov\|mpg\|mpeg\|avi\|fli\|gll\|dl\|xcf\|xwd\|flac\|mp3\|mpc\|ogg\|wav\)\(\s\)/\o033[01;35m\1.\2\o033[0m\3/g' \
+              --expression='s/\(\S*\)\.\(o\)\(\s\)/\o033[33m\1.\2\o033[0m\3/g' \
+              --expression='s/\(\S*\)\.\(f\|\|c\|h\)\(\s\)/\o033[32m\1.\2\o033[0m\3/g' \
+              --expression='s/\(\S*\)\.\(f90\|cpp\|cxx\|hxx\|hh\|hpp\|cc\)\(\s\)/\o033[1;32m\1.\2\o033[0m\3/g' \
+              --expression='s/\(\S*\)\.\(sh\|csh\|tcsh\|ksh\|pbs\|bat\)\(\s\)/\o033[1;32m\1.\2\o033[0m\3/g' \
+              --expression='s/\(\S*\)\.\(pdf\|psh\|dvi\|ps.gz\)\(\s\)/\o033[1;35m\1.\2\o033[0m\3/g' 
+    else
+        $ISH_COLUMN $1 | expand
+    fi
+    return 0 # fail silently if colourization fails
+}
+
+function ish_ls_meta() {
+    # Colourizes the file listing after sorting and extracting metadata.
+    #   $1 = file containing the listing and the metadata
+    local tmpfile=$(mktemp)
+    if $ISH_LONG; then
+        sort $1 \
+            | sed --expression='s/\(.*\)'$ISH_SEP'\(.*\)/\2 \1/' \
+            | awk '{printf "%s %s %12s %s %s %s\n",$1,$2,$3,$4,$5,$6}' \
+            > $tmpfile
+    else
+        sort $1 \
+            | sed --expression='s/\(.*\)'$ISH_SEP'\(.*\)/\2 \1/' \
+            | awk '{print $6}' \
+            > $tmpfile
+    fi
+    ish_colourize $tmpfile
+    if $ISH_DEBUG; then
+        ls -l $tmpfile
+    fi
+    rm --force $tmpfile
+}
+
+function ish_dir_filter() {
+    # Lists files from a directory within an index file,
+    #   $1 = the directory to list
+    #   $2 = pattern (may be blank) (still used?)
+    # Both may contain wildcards * and ?
+    local folder="$1" 
+    local filter="$2" 
+
+    # If no pattern is given, use the default
+    if [ -z "$filter" ] && ! $ISH_FIND ; then
+        filter='?*'
+    fi
+    while [ "${folder:0:1}" == "/" ] && $ISH_ABS ; do
+        folder="${folder:1}"
+    done
+    # If $folder contains wildcards, display the full path.
+    # Otherwise, only display the file name. 
+    # By a trick, both cases become the same: if the folder
+    # contains wildcards, we prepend it to the filter and make folder=
+    if [[ "$folder" =~ [*?] ]] || $ISH_FIND ; then
+        filter="$(ish_normalize "$folder$filter")"
+        folder=
+    fi
+    # Append the pwd to folder 
+    folder=$(ish_normalize "$ISH_PWD/$folder")
+    # Escape common special $ZGREP characters from folder and filter
+    # Escaped characters: .+^$()
+    local foldername="$folder"  #save actual folder name for later use
+    # The following should be possible within bash:
+    filter=$(echo "$filter"|sed --expression='s/[\.+\(\)$]/\\&/g')
+    folder=$(echo "$folder"|sed --expression='s/[\.+\(\)$]/\\&/g')
+    # Convert the wildcards in the pattern to ones that $ZGREP can use:
+    #  Any (non-slash) character:            ? ->  [^/]
+    #  Any number of (non-slash) characters: * ->  [^/]*
+    filter=$(echo "$filter"|sed --expression='s/?/[^\/]/g' --expression='s/*/[^\/]*/g')'/?'
+    if $ISH_FIND; then
+        filter='(.*/)?'$filter
+    fi
+    if $ISH_RECUR; then
+        filter=$filter'.*'
+    fi
+    # Note: $folder will not contain any wildcards, else the previous
+    # step would have included $folder into $filter.
+
+    # Find the matching files in index with regular expression Full
+    # pattern is directory+filter, and this pattern has to be matched
+    # between $ISH_BEGIN and $ISH_SEP:
+    local tmpfile=$(mktemp)
+    if [ -z "$folder" ]; then
+        regexp="^$ISH_BEGIN$filter$ISH_SEP"
+    else
+        regexp="^$ISH_BEGIN$folder/$filter$ISH_SEP"
+        foldername="$foldername/"
+    fi
+    if [ -n "$foldername" ]; then
+        if [ "$ISH_OLDFOLDER" != "$foldername" ]; then
+            echo
+            echo "$ISH_BEGIN$foldername:" | sed --expression='s/\/:$/:/'
+        fi
+    fi
+    ISH_OLDFOLDER="$foldername"
+    #echo REGEXP "$regexp"
+    if ! $ZGREP --extended-regexp "$regexp" $ISH_FILE > $tmpfile; then
+        if [[ -z "$2" || "$2" == '*' ]]; then
+            echo "No files found in directory $(ish_normalize $ISH_PWD/$1) in $ISH_FILE"
+        else
+            #echo "No file or directory $(ish_normalize $ISH_PWD/$1)/$2 in $ISH_FILE"
+                echo "No file or directory $(ish_normalize $ISH_PWD/$1/$2) in $ISH_FILE"
+        fi
+        if $ISH_DEBUG; then
+            ls -l $tmpfile
+        fi
+        rm --force $tmpfile
+        return 0 # no shame in having no files in a folder
+    elif [ -n "$foldername" ]; then
+        # Display sensibly, i.e., do not repeat the folder name on every line
+        local tmpfile2=$(mktemp)
+        local truefolderplusslash="$ISH_BEGIN${foldername}/"
+        cut -c ${#truefolderplusslash}- $tmpfile \
+            | grep --invert-match "^$ISH_SEP" \
+            > $tmpfile2
+        ish_ls_meta $tmpfile2
+        rm --force $tmpfile $tmpfile2
+    else
+        ish_ls_meta $tmpfile
+        rm --force $tmpfile
+    fi
+}
+
+function ish_ls_pattern() {
+    # List files conforming to a pattern from a given directory
+    #   $1=  folder/files (may contain wildcards)
+    local folder="$1"
+    local filter="${2:-}"
+    # if no second argument is given and first is not explicitly a
+    # directory (ie not ending in a slash), separate the filter
+    if [[ "$filter" == "" && "$folder" != */ ]]; then
+        # check if $folder a directory
+        local d="$(ish_normalize "$ISH_PWD/$folder")"
+        # don't let wildcards have meaning
+        d="${d//\*/@_@_@}"
+        d="${d//\?/@_@_@}"
+        #the above may breaks the wildcard functionality of directories?
+        # test does not work for '*x'
+        if ! $ZGREP --quiet -- "$d/" "$ISH_FILE"; then
+            #not a directory, then split it
+            if [[ "$folder" =~ / ]]; then
+                folder="${1%/*}/"
+                filter="${1##*/}"
+            else
+                filter="$folder"
+                folder='./'
+            fi
+        fi
+    fi    
+    ish_dir_filter "$folder" "$filter" 
+}
+
+function ish_du() {
+    local d="$(ish_normalize "$ISH_PWD/$1")"
+    local pattern="[^/]*/$ISH_SEP"
+    if [ -z "$d" ]; then
+        pattern="^$pattern"
+    else
+	if $ISH_ABS; then
+            pattern="^/$d/$pattern" 
+	else
+            pattern="^$d/$pattern" 
+	fi
+    fi
+    local dirs=`$ZGREP -E -e "$pattern" "$ISH_FILE" | awk -F/$ISH_SEP '{print $1}'`
+    if $ISH_RECUR; then
+        let ISH_COUNT++
+        for sub in $dirs; do
+            local relsub=`echo $sub | awk -F"$ISH_PWD/" '{print $NF}'`
+            ish_du $relsub
+        done
+    else
+        if [ -z "$d" ]; then
+            ISH_COUNT=`$ZGREP -E -e "/$ISH_SEP" $ISH_FILE|wc -l`
+        else
+            ISH_COUNT=`$ZGREP -E -e "^$d/.*/$ISH_SEP" $ISH_FILE|wc -l`
+        fi
+        let ISH_COUNT++
+    fi
+    local sums=
+    if [ -z "$d" ]; then
+        sums=(`$ZGREP -v "/$ISH_SEP" "$ISH_FILE" | awk 'BEGIN{a=0;b=0;}{a+=$3;b++}END{print a, b}'`)
+    else
+	if $ISH_ABS; then
+            sums=(`$ZGREP -E -e "^/$d/" "$ISH_FILE" | grep -v "/$ISH_SEP" | grep -v '^@VFU/' | awk 'BEGIN{a=0;b=0;}{a+=$3;b++}END{print a, b}'`)
+	else
+            sums=(`$ZGREP -E -e "^$d/" "$ISH_FILE" | grep -v "/$ISH_SEP" | grep -v '^@VFU/' | awk 'BEGIN{a=0;b=0;}{a+=$3;b++}END{print a, b}'`)
+	fi
+    fi
+    local sum=${sums[0]}
+    local nfiles=${sums[1]}
+    #report in KB with rounding 
+    ISH_LAST_SUM=$sum
+    ISH_LAST_NF=$nfiles
+    let sum=$sum+512
+    let sum=$sum/1024
+    if [ -z "$d" ]; then
+        echo "${sum}	${nfiles}	."
+    else
+        echo "${sum}	${nfiles}	$d"
+    fi
+}
+
+function ish_ls() {
+    # List files conforming to several patterns
+    #   $1 = folder/files (may contain wildcards)
+    #   $2 = folder/files (may contain wildcards)
+    #   $3 = ....
+    # Note that duplicate entries from several wildcards are not removed.
+    if [ -z "$ISH_FILE" ]; then
+        echo "No index file set (set with 'use')."
+        return 72
+    fi
+    local addleft=
+    local addright=
+    local pattern=
+    ISH_OLDFOLDER="$ISH_PWD/" 
+    if [ -z "${1:-}" ]; then
+        ish_ls_pattern "$addleft$pattern$addright"
+    else
+        for pattern in "$@"
+        do
+            ish_ls_pattern "$addleft$pattern$addright"
+        done
+    fi
+    ISH_OLDFOLDER=
+}
+
+
+function ish_check_connexions_index() {
+    # Checks for unreachable directories in a file listing
+    #   $1 = file listing in the format filename@@@@@metadata
+    # extract existing directories to tmpfile
+    local tmpfile=$(mktemp)
+    grep "/$ISH_SEP" "$1" > $tmpfile
+    # pre-compute following expression for inner loop
+    local ownership="$(id -nu)/$(id -ng)"
+    grep -e '/..*'"$ISH_SEP" "$1" | while read line; do
+        local dir= #if only to stress that dir is local to this subshell
+        dir=${line%%$ISH_SEP*}
+        while [[ "$dir" =~ \/ ]]
+        do
+            dir="${dir%/*}"
+            if ! grep -q "^$dir/$ISH_SEP" $tmpfile ; then
+                echo "$dir/$ISH_SEP---------- $ownership  0 ---------- --------"
+                echo "$dir/$ISH_SEP---------- $ownership  0 ---------- --------" >> $tmpfile
+            fi
+        done
+    done 
+    rm --force $tmpfile
+    return 0
+}
+
+function ish_script_start() {
+    cat > $ISH_SCRIPT <<EOF2
+#!/bin/bash
+#PBS -q archive
+#PBS -N ish_hpss
+#PBS -j oe
+#PBS -m e
+cd \$PBS_O_WORKDIR
+trap "echo 'Script interrupted before finished';exit 129" INT TERM
+$ISH <<EOF
+  register $ISH_REG
+  !cd $PWD
+EOF2
+}
+
+function ish_script_finish() {
+    cat >> $ISH_SCRIPT <<EOF2
+  exit
+EOF
+status=\$?
+if [ \$status == 0 ]
+then
+  echo index built successfully
+else
+  echo error in building index
+  exit \$status
+fi
+EOF2
+}
+
+function ish_igz_extract() {
+    # extract a field from the igz's header
+    #   $1 = field name (VERSION/AUTHOR/PLACE/DATE/TIME/NAME/USER/PWD/HOST/DATESTAMP/CMD)
+    local rot13fieldname=$(ish_rot13 @ISH/$1/)
+    local rot13line=$($ZGREP -E -e "^$rot13fieldname" $ISH_FILE|head -n1)
+    local rot13fieldname=$rot13fieldname:
+    local rot13result=$(echo $rot13line | cut -c ${#rot13fieldname}-)
+    ish_rot13 $rot13result
+}
+
+function ish_dir_list() {
+    # Long-lists the files in a directory recursively 
+    # Used in command_index
+    #   $1 = directory to traverse
+    local -r directory=$1
+    \ls $directory -lR -p --time-style="+$ISH_TIMEFORMAT" \
+        | grep -v -E -e '^total [0-9]*' \
+        | while read line; do
+           case $line in 
+               *:) d=${line%:};; 
+               "") d=;; 
+                *) set -- $line
+                   echo $1 $3/$4 $5 $6 $7 $d/$8;;
+           esac;
+    done | awk '{printf "%s'$ISH_SEP'", $6;sub($6,"");print}' \
+         | sed --expression='s/^\.\///' 
+}
+
+function ish_purge_list() {
+    # Long-lists the files in a purge list
+    # Used in command_pindex
+    #   $1 = file to parse 
+    local ownership=$(id -un)/$(id -gn)
+    awk '{printf "%s'$ISH_SEP'---------- '$ownership' %12d %10s %8s\n", $13, $11, substr($6,3), substr($7,1,5) }' $1
+}
+
+function ish_prompt() {
+    # Creates the prompt for interactive use
+    local prmpt=
+    if $ISH_DRY; then 
+        prmpt="> "
+    else
+	if $ISH_COLOUR; then
+            prmpt="[7m[ish]${ISH_FILE##*/}/$ISH_PWD>[0m "
+	else
+            prmpt="[ish]${ISH_FILE##*/}/$ISH_PWD> "
+	fi
+    fi
+    echo "${prmpt/\/\.\//}"
+}
+
+function ish_use() { 
+    # Sets index file to use in the commands pwd, ls & cd.
+    #   $1 = index file to be used
+    if (( $# != 1 )); then
+        stderr "Error: use takes (only) one argument" 
+        return $ISH_SYNTAX
+    fi
+    local idxfile=$(ish_full_path "$ISH_REG/$1")
+    if ! [ -f $idxfile ]; then
+        idxfile=$(ish_full_path "$1")
+    else
+        # if igz file exists in both the register and the current dir, warn!
+        if [ -f "$1" ]; then
+            if [[ ${1:0:2} == "./" || ${1:0:1} == "/" ]]; then
+                idxfile=$(ish_full_path "$1")                
+            else
+                if [[ "$ISH_REG" != "." && "$(ish_full_path $ISH_REG)" != "$PWD" ]]; then
+                    stderr "Warning: $1 exists in register and in current directory"
+                    stderr "         The register one is used unless you say './$1'"
+                fi
+            fi
+        fi
+    fi
+    if [ -f "$idxfile" ]; then
+        ISH_FILE="$idxfile"
+        local tmpfile=$(mktemp)
+        $ZGREP -v -E -e '^@VFU/' $ISH_FILE > $tmpfile
+        if ! grep --quiet -v -E -e '^/' "$tmpfile"; then
+            ISH_ABS=true
+            ISH_BEGIN='/'
+        else
+            ISH_ABS=false
+            ISH_BEGIN=
+        fi
+        rm --force $tmpfile
+        command_cd :
+    elif [[ "${idxfile%*.igz}" == "${idxfile}" ]]; then
+        # It would be nice to have a special case here of opening the index associated
+        # with a tar ball.  Trouble is figuring out what it's filename would be.
+        # The following is a first try
+        local newidxfile=
+        local cmd=$(ish_igz_extract CMD)
+        cmd="${cmd//&//}"
+        if ! [[ $cmd =~ "(from ish tar)" ]]; then
+            if [[ "$cmd" == "hindex" ]]; then
+                cmd="${cmd} "
+            fi
+            cmd="${cmd#hindex *}"
+            if [ -z "$cmd" ]; then
+                newidxfile="$cmd$1.igz"
+            else
+                newidxfile="$cmd/$1.igz"
+            fi
+            newidxfile="${newidxfile//\//_}"
+            ish_use $newidxfile
+        else
+            stderr "Cannot find index file for $idxfile"
+            return 72
+        fi
+    else
+        stderr "Cannot find index file $idxfile"
+        return 72
+    fi
+}
+
+function main() {
+    # main function, handles command line arguments and cli
+    local ish_err=0
+    local ish_cmd_on_line=false
+    local ish_cmd=
+    local cmd=
+    # for consistency, follow all symlinks in the current directory
+    export PWD=`pwd -P`
+    # start using correct register
+    if ! command_register "$ISH_REG"; then
+        echo "Incorrect register - directory must exist."
+        return 1
+    fi
+    # check options
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        ish_usage
+    elif [[ "${1:-}" == "--version" ]]; then
+        echo "$(basename $ISH) $(ish_extract VERSION)"
+        echo "$(ish_extract AUTHOR) - $(ish_extract AFFILIATION)/$(ish_extract MODIFIED)"
+    else
+        # Process command line arguments
+        if [[ -f "${1:-}" || -f $ISH_REG/"${1:-@@@@@}" ]]; then
+            if command_use "${1:-}"; then
+                shift # the rest of the arguments may be a command
+            fi
+        elif [[ -f "$ISH_REG/hpss.igz" || -f hpss.igz ]]; then
+            command_use hpss.igz
+        fi
+        if [ -n "${1:-}" ]; then
+            ish_cmd_on_line=true        # flag that a command was given
+            ish_cmd="$@"                # command 
+            ISH_COLOUR=false            # no colour
+        else
+            ish_cmd_on_line=false       # flag that no command was given 
+            if [ -r ~/.ish_history ]; then
+                history -r ~/.ish_history   # read old history from file
+            fi
+            if tty >&/dev/null; then
+                echo "$(basename $ISH) $(ish_extract VERSION)"
+                echo "$(ish_extract AUTHOR) - $(ish_extract AFFILIATION)/$(ish_extract MODIFIED)"
+            fi
+        fi
+        # Process command(s)
+        while $ish_cmd_on_line || read -p "$(ish_prompt)" -e ish_cmd 
+        do
+            if [ -n "$ish_cmd" ]; then
+                history -s -- "$ish_cmd" # store in command line history
+                set -f                   # do not expand * etc.
+                set -- $ish_cmd          # store words in positional parameters
+                set +f                   # expand * etc. again
+                cmd="$1"                 # extract the command
+                shift                    # leave the parameters in $1, $2, etc
+                case "$cmd" in
+                        pwd) echo "$ISH_PWD in $ISH_FILE";;
+                        tar) command_tar    "$@";;
+                       htar) command_htar   "$@";;
+                      index) command_index  "$@";;
+                     hindex) command_hindex "$@";;
+                     hindex-stage1) ISH_STAGE=1 command_hindex "$@";;
+                     hindex-stage2) ISH_STAGE=2 command_hindex "$@";;
+                     pindex) command_pindex "$@";;
+                         cd) command_cd     "$@";;
+                        use) command_use    "$@";;
+                      unuse) command_unuse  "$@";;
+                       info) command_info   "$@";;
+                   settings) command_settings "$@";;
+                   register) command_register "$@";;
+                      avail) command_avail  "$@";;
+                         du) command_du     "$@";;
+                       help) command_help   "$@";;
+                         ls) if [[ "${1:-}" == "-lr" || "${1:-}" == "-rl" ]]; then
+                                 ISH_LONG=true
+                                 ISH_RECUR=true
+                                 shift
+                             elif [[ "${1:-}" == "-l" && "${2:-}" == "-r" ]]; then
+                                 ISH_LONG=true
+                                 ISH_RECUR=true
+                                 shift 2
+                             elif [[ "${1:-}" == "-r" && "${2:-}" == "-l" ]]; then
+                                 ISH_LONG=true
+                                 ISH_RECUR=true
+                                 shift 2
+                             elif [[ "${1:-}" == "-l" ]]; then
+                                 ISH_LONG=true
+                                 ISH_RECUR=false
+                                 shift
+                             elif [[ "${1:-}" == "-r" ]]; then
+                                 ISH_LONG=false
+                                 ISH_RECUR=true
+                                 shift
+                             else
+                                 ISH_LONG=false
+                                 ISH_RECUR=false
+                             fi
+                             ish_ls "$@"
+                             ISH_RECUR=false;;
+                       find) ISH_LONG=false ISH_FIND=true ish_ls "$@";;
+                     '!pwd') pwd "$@";;
+                      '!cd') cd "$@" 
+			     export PWD=`pwd -P` ;;
+                      '!ls') command_lls "$@";;
+               color|colour) if [ "$1" == "0" ]; then 
+                                 ISH_COLOUR=false
+                             else
+                                 ISH_COLOUR=true
+                             fi
+                             ;;
+                     script) ISH_DRY=true
+                             if [ -z "${1:-}" ]; then
+                                 ISH_SCRIPT=$(mktemp)
+                             else
+                                 ISH_SCRIPT="$1"
+                                 touch "$1"
+                                 chmod +x "$1"
+                             fi
+                             ish_script_start
+                             ;;
+                      check) if $ISH_DRY ; then
+                                 echo "check $@"
+                             else
+                                 if [ "${1:-}" == "-n" ]; then
+                                     shift
+                                     ish_err_msg $ish_err "$@"
+                                     ish_err=0
+                                 else
+                                     ish_err_msg $ish_err "$@"
+                                     if [ "$ish_err" != 0 ]; then
+                                         break
+                                     fi
+                                 fi
+                             fi
+                             ;;
+                       exit) #break
+                             if ! $ish_cmd_on_line ; then
+                                 # write interactive commands to history file
+                                 if [ -w ~/.ish_history ]; then
+                                     # just make sure we can write
+                                     # there as sometimes home is
+                                     # mounted read-only.
+                                     history -w ~/.ish_history
+                                 else
+                                     : # not worried/don't care about
+                                       # history not being written
+                                 fi
+                             fi
+                             if $ISH_DRY; then
+                                 ish_script_finish
+                                 ISH_DRY=false
+                                 if ! [ -x $ISH_SCRIPT ]; then
+                                     cat $ISH_SCRIPT
+                                     rm -f $ISH_SCRIPT
+                                 fi
+                             else
+                                 exit $ish_err
+                             fi
+                             ;;
+                          *) echo "Unknown command '$cmd'."
+                             echo "Type 'help' for a list of commands."
+                             (exit 127)
+                             ;;
+                esac
+                ish_err=$?
+                if $ish_cmd_on_line; then
+                    break # only one command from the command line 
+                fi
+            fi
+        done
+        if ! $ish_cmd_on_line; then
+            # write interactive commands to history file
+            if [ -w ~/.ish_history ]; then
+                # just make sure we can write there as sometimes home
+                # is mounted read-only.
+                history -w ~/.ish_history
+            else
+                : # not worried/don't care about history not being written
+            fi
+        fi
+        # return the error that matters
+        if $ISH_DRY; then
+            ish_script_finish
+            ISH_DRY=false
+            if ! [ -x $ISH_SCRIPT ]; then
+                cat $ISH_SCRIPT
+                rm -f $ISH_SCRIPT
+            fi
+        fi                 
+        return $ish_err
+    fi
+}
+
+# ALL THE COMMANDS, ALPHABETICALLY, FOR LACK OF A BETTER STRUCTURE
+
+function command_avail() {
+    # List available igz files
+    #   if -a argument is given, then this shows old files as well
+    if (( $# > 1 )); then
+            stderr "Error: avail takes at most 1 argument"
+            return $ISH_SYNTAX
+    fi
+    local exclude
+    if [ "${1:-}" == "-a" ]; then
+        exclude="${ISH_SEP}"'$'
+    else
+        exclude='_........_.......igz$'
+    fi
+    echo "Available Index Files:"
+    if [ "$ISH_REG" == "." ]; then
+            if \ls ./*.igz >&/dev/null; then
+                echo "* in local directory"
+                \ls -1 -altr --time-style="+$ISH_TIMEFORMAT" --color=never *.igz | grep -v -E -e "$exclude" | awk '{printf "%s %s %s\n", $6, $7, $8}'
+            else
+                echo "No igz files found"
+            fi            
+    else
+        local nothing=true
+        if \ls $ISH_REG/*.igz >&/dev/null; then
+            echo "* in register directory"
+            (cd $ISH_REG; \ls -1 -altr --time-style="+$ISH_TIMEFORMAT" --color=never *.igz | grep -v -E -e "$exclude" | awk '{printf "%s %s %s\n", $6, $7, $8}')
+            nothing=false
+        fi
+        if [ $PWD != $ISH_REG ] ; then
+            if \ls ./*.igz >&/dev/null; then
+                echo "* in local directory:"
+                \ls -1 -altr --time-style="+$ISH_TIMEFORMAT" --color=never *.igz | grep -v -E -e "$exclude" | awk '{printf "%s %s %s\n", $6, $7, $8}'
+                nothing=false
+            fi
+        fi
+        if $nothing; then
+            echo "No igz files found anywhere"
+        fi
+    fi
+}
+
+function command_cd() {
+    # Changes the current directory in the index file.
+    #   $1 = the new directory (relative to the last)
+    # if omitted , go to root
+    if (( $# > 1 )); then
+        stderr "Error: cd takes at most 1 argument" 
+        return $ISH_SYNTAX
+    fi
+    if [ -z "$ISH_FILE" ]; then
+        echo "No index file set (set with 'use')."
+        return 72
+    else
+        local newdir="${1:-}"
+        if [[ "${newdir:0:1}" == ":" || -z "$newdir" ]]; then
+            # Note: colon indicates path from root of index
+	    # Only in cd: remove in future as that's nonsense
+            newdir=${newdir:1}
+        else
+            newdir=$(ish_normalize "$ISH_PWD/$newdir")
+        fi
+        if [ -n "$newdir" ]; then
+            # check whether this directory exists in index file            
+            # don't let wildcards have meaning
+            local d="$newdir"
+            d="${d//\*/\\\*}"
+            d="${d//\?/\\\?}"
+            d="${d//|/\\\?}"
+            if $ZGREP --quiet "^$ISH_BEGIN$d/$ISH_SEP" $ISH_FILE ; then
+                ISH_PWD="$newdir"
+            else
+                echo "No directory $newdir in $ISH_FILE"
+                return 1
+            fi
+        else
+            ISH_PWD="./"
+        fi
+    fi
+}
+
+function command_help() {
+    # What you get when you type the ish command help
+    if (( $# > 1 )); then
+        stderr "Error (help): too many arguments"
+        return $ISH_SYNTAX
+    fi
+    case "${1:-}" in
+    ls) 
+            ish_top_help ls '[OPTION] [ PATTERN [PATTERN ... ] ]' 'list directory contents'
+            cat <<-EOF
+	Lists files in the index according to one or more patterns.  In
+	interactive mode, the files are displayed in colour.  The list is
+	sorted alphabetically by name.
+	
+	Patterns are of the form [PATH[/]][FILES] and may contain wildcards *
+	and ?.  Without FILES, the form PATH only lists the directory name,
+	while PATH/ lists the files in the directory.
+	
+	When no patterns are given, ls lists files in the current directory in
+	the current index file (as given on the command line or set with use).
+		
+	Paths are relative to the current directory (as set with 'cd'). To
+	specify a path from the root of the index, an initial slash (/)
+	should be put in front of the path.
+	
+	The optional argument can be
+	
+	  -l  list in long format, displaying information on file sizes,
+	      modification times, and other metadata present in the index.
+	
+	  -r  lists recursively into subdirectories.
+	
+	To give both options, they have to be combined into one, e.g. -lr.
+EOF
+    ;;
+    du) 
+            ish_top_help du '[-r] [PATH]' 'sum file sizes in directories'
+            cat <<-EOF
+	Lists the number of the files and their sizes in kilobytes 
+	contained in the directory PATH.
+	
+	When no PATH is given, du sums files in the current directory in
+	the current index file (as given on the command line or set with use).
+	Note that the count is cumulative, i.e. files in subdirectories are 
+	also counted.
+		
+	PATHs are relative to the current directory (as set with 'cd'). 
+	Wildcards are not supported.
+	
+	The optional argument -r can be given to recursively list the sizes 
+	and the number of files in subdirectories.
+EOF
+    ;;
+    cd) 
+            ish_top_help cd '[PATH]' 'set current directory in index'
+            cat <<-EOF
+	Change the current directory within the index to the directory
+	specified by PATH.
+	
+	The new path is relative to the previous current directory, unless
+	preceded by a colon (:), in which case it specifies a path from the
+	root of the index.  If the index contains absolute paths, the root can
+	be indicated by an initial slash (/) as well.
+	
+	If no PATH is given, the current directory is set to the root
+	directory of the index file.
+
+	The current directory is always displayed in the ish prompt.
+EOF
+    ;;
+    find) 
+            ish_top_help find 'PATTERN ...' 'recursively find files in index'
+            cat <<-EOF
+	Recursively searches the directory tree in the index from the current
+	directory (set by 'cd') for files following one or more patterns. 
+	PATTERN may be of the form PATH/FILE or just FILE, and can contain the
+	wildcards * and ?.
+EOF
+    ;;
+    index)
+            ish_top_help index 'PATH|TARBALL' 'make an index for a directory or tarball'
+            cat <<-EOF
+	Makes an index file of a directory (PATH) or tarball (TARBALL). The
+	PATH, or the paths stored in the tarball, can be either absolute or
+	relative.  The tarball can be in compressed format, provided the 
+	local tar installation supports it.
+	
+	The index files are stored in the register directory (~/.ish_register
+	by default). See 'register' for details.
+	
+	For consistency, if the parent directory of any directory in PATH or
+	the TARBALL is not in that PATH or in that TARBALL, it gets added to
+	the index as a stub (i.e., not with its full content).  For example,
+	'index /home/scinet/s/rzon' will include '/home', 'scinet', and 's' 
+	as stubs, which will seem to only contain one directory. Similarly,
+	if test.tar was created (not from within ish) with 'tar cf test.tar
+	/home/scinet/s/rzon', then 'index test.tar' will add a stub for /home.
+	
+	Ish automatically assigns a name to the index file, following this
+	naming convention
+	
+	 - A directory index stored in the current directory will be called
+	   PATH.igz, with any slashes replaced by underscores.
+	
+	 - A directory index stored in the registry will be called
+	   ABSPATH.igz, where ABSPATH is the absolute path to the directory
+	   PATH, again, with slashes replaced by underscores.
+	
+	 - A tar index will be called TARBALL.igz, with slashes replaced with
+	   underscores.
+	
+	 - When running an index command again, or running an index command
+	   that would result in the name of an existing index that would be
+	   overwritten, the existing index file NAME.igz gets renamed to
+	   NAME_DATE_TIME.igz, where date is the date of the existing index file.
+	   The exception to this rule is that if the new index file has 
+	   identical content to the old one, the old one is removed.
+	
+	Once the indexing is done, the index file becomes the current one in
+	the ish shell.
+	
+	The index file for a tarball can be created when the tar is made,
+	using the ish command tar (see 'tar').
+EOF
+    ;;
+    pindex)
+            ish_top_help pindex '[FILE]' 'make an index for a purge file'
+            cat <<-EOF
+	Makes an index file from the monthly scratch purge file generated for
+	you at Scinet.  (Obviously, this is a very SciNet-specific command). 
+	This list only contains files, so for consistency, stubs are added for
+	directories.
+	
+	If no FILE is given, ish searches for your most current purge list.
+	
+	The name of the index file is composed of the file name of the purge
+	file, without underscores, and prepended by a path with slashes
+	replaced by underscores. The index file is stored in the register
+	directory (~/.ish_register by default). See 'register' for details.
+	
+	Once the indexing is done, the index file becomes the current one in
+	the ish shell.
+EOF
+    ;;
+    exit) 
+            ish_top_help  exit '' 'exit ish'
+            cat <<-EOF
+	Ish will exit with the exit status of the last command that was run.
+	
+	When input is redirected to be read from a file or here document, the
+	end-of-file also exits ish, so in that case exit is optional.
+EOF
+    ;;
+    check) 
+            ish_top_help  check '[-n] [COMMENT]' 'exit ish if the previous command had an error'
+            cat <<-EOF
+
+	Ish will show the commens, then the error message of the last
+	command, and will exit with ist exit status. Very useful and
+	recommended when doing multiple nontrivial actions in one ish
+	session.
+	
+	If the optional argument -n is given, ish does not exit.
+EOF
+    ;;
+    color|colour) 
+            ish_top_help  colour 'ARG' 'set colour usage'
+            cat <<-EOF
+	Switches the usage of colour in listings on if ARG=1 and off if ARG=0.
+	By default, colour is on in interactive sessions, and off in single
+	command mode.
+	
+	The current colour setting can be found with the 'settings' command.
+EOF
+    ;;
+    help) 
+            ish_top_help help '[COMMAND]' 'show help on ish commands'
+            cat <<-EOF
+	If no COMMAND is given, a list of all ish commands, with a brief
+	description, is given.
+EOF
+    ;;
+    pwd)
+            ish_top_help pwd '' 'show current directory'
+            cat <<-EOF
+	Shows the current directory within the index (as set by 'cd').  
+	
+	This command should be rarely needed, as the current directory is
+	always displayed as part of the ish prompt.
+EOF
+    ;;
+    register)
+            ish_top_help register '[DIR]' 'set new index file location'
+            cat <<-EOF
+	Sets the location where index files are stored.  This location is
+	called the register.  DIR must be an existing directory on the file
+	system.  If DIR is omitted, the register is set to the default
+	location.
+	
+	The default location of the register is the (hidden) directory
+	~/.ish_register, or is set by the environment variable ISHREGISTER.
+	
+	Index files in the current directory will be found by 'use' as well,
+	regardless of the register setting. But to store an index file in the
+	current directory (using 'index', 'hindex', or 'pindex'), the register
+	has to be set to '.' first.
+	
+	The current setting of the register can be found with 'settings'.
+EOF
+    ;;
+    settings)
+            ish_top_help settings '' 'list settings'
+            cat <<-EOF
+	Lists settings such as colour, register location, and current and 
+	previously used index files.
+EOF
+    ;;
+    info)
+            ish_top_help info '' 'show information on the current index file'
+            cat <<-EOF
+	Lists information such as creation date, ish version, how it was created.
+EOF
+    ;;
+    tar)
+            ish_top_help tar '[OPTION] TARBALL [DIR][FILES] ...' 'tar and make index'
+            cat <<-EOF
+	Tars a directory or files list as usual, AND creates the corresponding
+	index file. It should be equivalent to running the same tar command
+	from the shell (i.e. not within ish), followed by "ish index TARBALL".
+	
+	Common tar options
+	
+	  -c  create the file.
+	
+	  -z  gzip the tarball. 
+	
+	  -j  bzip2 the tarball.
+	
+	  -f  should be the last option, and indicates that output should go to
+	      the tarball.
+	
+	To give multiple options, they have to be combined into one, e.g. -czf.  
+	'-f' must be the last option. Other options can be found from the tar
+	man page.
+EOF
+    ;;
+    unuse|use)
+            ish_top_help use 'INDEX' 'set the index file'
+            cat <<-EOF
+	    unuse
+
+	Sets the current index file to INDEX. This file should reside in the
+	register directory (see 'register') or the current directory.  INDEX
+	should include the index file extension '.igz'. The 'unuse' command 
+	returns to a previously used index file in the session.
+	
+	Note that the index file can also be set when starting ish with the
+	name of the index file as the first argument (e.g. ish data.tgz.igz).
+	Omitting the index file when starting ish will cause if to look for
+	hpss.igz.
+	
+	See 'index', 'hindex' and 'pindex' on how to create index files, and on their
+	naming scheme.
+
+	The current index file is always displayed in the ish prompt.
+EOF
+    ;;
+    avail)
+            ish_top_help avail '[-a]' 'list available index files'
+            cat <<-EOF
+	Displays a list of index files the register directory (see 'register')
+	or the current directory. These index files can be accessed with the
+	'use' command.
+	
+	The list contains the creation date and time of the igz file. Note that
+	this need not be the same as the creation date of the corresponding
+	tar.
+	
+	By default, older versions of the igz files (which are automatically
+	saved by index and hindex) are not shown.
+	
+	The optional argument can be
+
+	  -a  When given, older saved version of the igz files are also listed.
+	
+	See 'index', 'hindex' and 'pindex' on how to create index files, and on their
+	naming scheme.
+EOF
+    ;;
+    '!cd'|'!pwd'|'!ls'|'!COMMAND'|'!command'|'!')
+            ish_top_help '!COMMAND' '[ARGS]' 'local commands (ls, cd, pwd only)'
+            cat <<-EOF
+	Runs a local command. This is intended to allow the local directory to
+	be changed and listed. Any arguments will be passed to the command.
+	
+	Only the commands ls, cd and pwd will be accepted to run locally.
+EOF
+    ;;
+    hindex)
+            ish_top_help hindex '[PATH|TARBALL]' 'make index for hpss folder/tarball (hpss only)'
+            cat <<-EOF
+	Makes an index file of a directory (PATH) or tarball (TARBALL) on hpss.
+	The distinction is made on whether the argument has the extension
+	.tar, .tar.gz, .tgz, .tar.bz2, .tbz2, or tb2.
+	
+	The PATH, or the paths stored in the tarball, can be either absolute
+	or relative.  If the tarball is uncompressed, it should ideally have 
+	been created with htar.
+	
+	If neither a PATH nor a TARBALL is given, hindex will generate an
+	index for your whole hpss directory, and store the index in hpss.igz, 
+    with paths stored relatively to the user's directory on hpss ($ARCHIVE).
+	
+	For consistency, if the parent directory of any directory in PATH or
+	the TARBALL is not in that PATH or in that TARBALL, it gets added to
+	the index as a stub (i.e., not with its full content).  For example,
+	'hindex /archive/s/scinet/rzon' will include /archive, /archive/scinet
+	and /archive/scinet/s as a stubs, which will seem to only contain one
+	directory. Similarly, if test.tar was created (not from within ish)
+	with 'htar cf test.tar /home/scinet/s/rzon', then 'hindex test.tar'
+	will add astub for /home, /home/scinet and /home/scinet/s.
+	
+	Ish automatically assigns a name to the index file, following this
+	naming convention
+	
+	 - The directory index will be called PATH.igz, with any slashes
+	   replaced by underscores.
+	
+	 - A tar index will be called TARBALL.igz, with slashes replaced with
+	   underscores.
+	
+	 - The index will be called hpss.igz when hindex is called without
+	   argument.
+	
+	 - When running an hindex command again, or running an hindex command
+	   that would result in an existing index getting overwritten, the
+	   existing index file NAME.igz gets renamed to NAME_DATE_TIME.igz,
+	   where DATE and TIME are of the existing index file.  The exception to
+	   this rule is that if the new index file has identical content to
+	   the old one, the old one is removed.
+	
+	Ish calls the hsi application under the hood to get the directory
+	listings. This means that this command has to be run on a system that
+	has hpss with hsi. This may mean you have to submit a job for building
+	the index. With the index file, you can then locally traverse the
+	listings in the index and see the modification times and file sizes.
+
+	If the tarball was created with htar (outside of ish), then the index
+	is created from the remote index file generated by a call to htar. So
+	this command may have to be run on a system that has hpss with htar.
+	
+	If the hpss-resident tarball was created with tar (outside of ish),
+	then no remote index file exists and ish will first request htar to
+	generate one. Because this may require the tar to be reclaimed from
+	tape, this is an expensive operation. So it is recommended to 1) use
+	htar, or, 2) at the point of tarring, use the tar command in ish , or, 3) if
+	the tar is already created and still available locally, to use the ish
+	command 'index'.
+	
+	Once the indexing is done, the index file becomes the current one in
+	the ish shell.
+	
+	The index files are stored in the register directory (~/.ish_register
+	by default). See 'register' for details.
+	
+	Note that the htarring and the creation of a local index file can be
+	done with one command, using the 'htar' ish command.
+EOF
+    ;;
+    htar)
+        ish_top_help htar 'OPTIONS TARBALL [DIR][FILES] ...' 'htar and make index (hpss only)'
+        cat <<-EOF
+	Htars a directory or set of files list as usual, AND creates the
+	corresponding local index file. It should be equivalent to running the
+	same htar command from the shell (i.e. not from within ish), followed
+	by "ish hindex TARBALL".
+	
+	Common htar options
+	
+	  -c  create the file. 
+	
+	  -p  Preserve time stamps.
+	
+	  -f  always the last option; indicates that output should go to a file. 
+	
+	To give multiple options, they have to be combined into one, e.g. -cpf.
+	Other options can be found from the htar man page.
+EOF
+    ;;
+    --all)
+        local separator="========================================================================"
+        ish_usage
+        echo $separator
+        echo "Details of commands within ish"
+        echo $separator
+        command_help help
+        echo $separator
+        command_help ls
+        echo $separator
+        command_help cd
+        echo $separator
+        command_help du
+        echo $separator
+        command_help find
+        echo $separator
+        command_help exit
+        echo $separator
+        command_help check
+        echo $separator
+        command_help index
+        echo $separator
+        command_help colour
+        echo $separator
+        command_help pwd
+        echo $separator
+        command_help register
+        echo $separator
+        command_help settings
+        echo $separator
+        command_help info
+        echo $separator
+        command_help tar
+        echo $separator
+        command_help avail
+        echo $separator
+        command_help use
+        echo $separator
+        command_help !COMMAND
+        echo $separator
+        command_help pindex
+        echo $separator
+        command_help hindex
+        echo $separator
+        command_help htar
+        echo $separator
+    ;;
+    "")
+        cat <<-EOF
+	
+	Shell Commands
+	
+	  Most common
+	    ls [-lr]   [DIR/[FILES]] ...       list FILES from DIR in index
+	    cd         DIR                     set current directory in index
+	    du [-r]    DIR                     sum file numbers and sizes
+	    find       PATTERN ...             find files following PATTERN in index
+	    index      DIR                     make index for folder/tarball
+	    index      TARBALL                 make index for folder/tarball
+	    exit                               exit the ish shell
+	
+	  More
+	    avail      [-a]                    list (all) available index files
+	    colour     1|0                     set colour usage
+	    help       [COMMAND]               show help on (all) commands
+	    register   [DIR]                   set new index file location 
+	    use        [INDEX]                 use INDEX or list available ones
+	    unuse                              use the previous index file again
+	    info                               show properties of the index file
+	    pwd                                show current directory
+	    settings                           show settings (colour, etc.)
+	    tar [-zcf] TARBALL DIR[/FILES] ... tar and make index
+	    check [-n] [COMMENT]               exit ish if error in last command
+	    !COMMAND   [ARGS]                  local commands (ls, cd, pwd only)
+	    pindex     [FILE]                  make index from a purge listing
+	
+	  Only in archive queue (hpss)
+	    hindex     [DIR]                   make index for hpss folder
+	    hindex     TARBALL                 make index for hpss tarball
+	    htar [-cf] TARBALL DIR[/FILES] ... htar and make index
+EOF
+    ;;
+    *) echo
+       echo "No help for $1"
+       return $ISH_SYNTAX
+    ;;
+    esac
+    echo
+}
+
+function command_hindex() {
+    # Makes index file of a directory on hpss or an existing htarball there.
+    #   $1  The name of the directory or of the htar-ball
+    # Result in file $1.igz
+    if (( $# > 1 )); then
+        stderr "Error: hindex takes at most 1 argument" 
+        return $ISH_SYNTAX
+    fi
+    if $ISH_DRY; then 
+        echo "hindex $@" >> $ISH_SCRIPT
+        return 0
+    fi
+    local tmpfile=$(mktemp)
+    local idxfile="${1:-hpss}.igz"
+    idxfile="$ISH_REG/${idxfile//\//_}"
+    case "${1:-}" in
+     *.tar)
+        if ! which $HTAR >&/dev/null ; then
+            stderr "This command requires $HTAR. Cannot find $HTAR."
+            return 127
+        fi
+        $HTAR -tvf "$1" 2>/dev/null > $tmpfile 
+        if [ "$?" != "0" ] ; then
+            echo "Could not read remote tar index file $1.idx - will try to use hsi or htar -X"
+            if ! which $HSI >&/dev/null; then
+                stderr "This command requires hsi. Cannot find hsi." 
+                return 127
+            fi
+            local lsout
+            lsout="$($HSI -q ls -l "$1" 2>&1)"
+            local status=$?
+            if [ "$status" != "0" ]; then
+                ish_err_msg $status hsi
+                echo "Could not retrieve file stats for $1 from hsi."
+                return $status
+            fi
+            local tarsize="$(echo $lsout | awk '{print $5}')"
+            if (( $tarsize > $ISH_HTARSIZELIMIT )); then
+                echo "Large tarball - will use hsi pipe"
+                $HSI get - : "$1" | tar -tvf - > $tmpfile
+                local status="$?"
+                if [ "$status" != "0" ]; then
+                    ish_err_msg $status hsi
+                    echo "Could not get listing of tarball $1 from hsi."
+                    return $status
+                fi
+            else
+                echo "Small tarball - can use htar"
+                $HTAR -Xf "$1" 2>/dev/null
+                local status="$?"
+                if [ "$status" != "0" ]; then
+                    ish_err_msg $status
+                    echo "Could not create tar index file for $1."
+                    return $status
+                else
+                    $HTAR -tvf "$1" 2>/dev/null > $tmpfile
+                    status="$?"
+                    if [ "$status" != "0" ]; then
+                        ish_err_msg $status
+                        echo "Still could not read tarball $1."
+                        return $status
+                    fi
+                fi
+            fi
+        fi
+        local tmpfile2=$(mktemp)
+        sed --expression='s/ -> .*//' "$tmpfile" \
+            | grep --invert-match "^HTAR: Listing complete"\
+            | grep --invert-match "^HTAR: HTAR"\
+            | sed --expression='s/^HTAR: //'\
+            | awk '{printf "%s'$ISH_SEP'", $6;sub($6,"");print}' \
+            | sed --expression='s/^\.\///' \
+            > $tmpfile2
+        ish_create_igz $idxfile $tmpfile2 "hindex $@"
+        local status=$?
+        rm --force $tmpfile
+        if [ $status == 0 ] ; then
+            command_use "$idxfile"
+            status=$?
+        fi
+        return $status            
+        ;;
+     *.tgz|*.tar.gz|*.tar.bz|*.tb2|*.tbz2)
+        if ! which $HSI >&/dev/null; then
+            stderr "This command requires hsi. Cannot find hsi." 
+            return 127
+        fi
+        local status=0
+        if $HSI get - : "$1" | gzip -d -c | tar -tvf - > $tmpfile ; then
+            local tmpfile2=$(mktemp)
+            sed --expression='s/ -> .*//' "$tmpfile" \
+                | awk '{printf "%s'$ISH_SEP'", $6;sub($6,"");print}' \
+                | sed --expression='s/^\.\///' \
+                > "$tmpfile2"
+            ish_create_igz $idxfile $tmpfile2 "index $@"
+            rm --force "$tmpfile2"
+        else
+            status=$?
+            echo "Could not read tarball $1"
+        fi
+        if [ $status == 0 ]; then
+            command_use "$idxfile"
+            status=$?
+        fi
+        return $status
+        ;;
+     *) :
+        # if stage 0 (meaning all) or 1, only do this part
+        if [[ "$ISH_STAGE" < 2 ]]; then
+            if ! which $HSI >&/dev/null; then
+                stderr "This command requires hsi. Cannot find hsi." 
+                return 127
+            fi
+            # checked that this works with hsi and hsi4
+            $HSI -O $tmpfile -q ls -aPR "$@"
+            status=$?
+            if [[ $status != 0 ]]; then
+                stderr "Something went wrong. Error code = $status"
+                ish_err_msg $status "HSI"
+                stderr "HSI output (restricted to last 100 lines max:)"
+                tail -n 100 $tmpfile 1>&2
+                return $status
+            fi
+            if [[ "$ISH_STAGE" == 1 ]]; then
+                cp $tmpfile $idxfile-stage1
+                status=$?
+                if [[ $status != 0 ]]; then
+                    stderr "Something went wrong. Error code = $status"
+                    ish_err_msg $status "CP"
+                    return $status
+                fi
+            fi
+        else
+            cp $idxfile-stage1 $tmpfile
+            status=$?
+            if [[ $status != 0 ]]; then
+                stderr "Something went wrong. Error code = $status"
+                ish_err_msg $status "CP"
+                return $status
+            fi
+        fi
+        if [[ "$ISH_STAGE" != 1 ]]; then
+            # skip this part in stage 1
+            #this is one serious hack:
+            #there's an issue with absolute paths: the /archive/scinet hack may not be needed!
+            local tmpfile2=$(mktemp)
+            if [ "${1:0:1}" == "/" ]; then
+                grep --invert-match --extended-regexp '/\.\.?$' $tmpfile \
+                    | sed \
+                      --expression='s/^DIRECTORY.\(.*\)$/\1\/ 0 x x x x x x x -------- ----------/' \
+                      --expression='s/^UNKNOWN.\(.*\)$/\1 0 x x x x x x x -------- ----------/' \
+                      --expression='s/^FILE.\([^ \t]*\)\s/\1 /' \
+                    | awk '{print $1 "'$ISH_SEP'----------","'"$(id -un)/$(id -gn)"'",$2,substr($11,7,4) "-" substr($11,1,2) "-" substr($11,4,2),$10}' \
+                    > $tmpfile2
+            else
+                grep --invert-match --extended-regexp '/\.\.?$' $tmpfile \
+                    | sed \
+                      --expression='s/^DIRECTORY.\(.*\)$/\1\/ 0 x x x x x x x -------- ----------/' \
+                      --expression='s/^UNKNOWN.\(.*\)$/\1 0 x x x x x x x -------- ----------/' \
+                      --expression='s/^FILE.\([^ \t]*\)\s/\1 /' \
+                    | awk '{print $1 "'$ISH_SEP'----------","'"$(id -un)/$(id -gn)"'",$2,substr($11,7,4) "-" substr($11,1,2) "-" substr($11,4,2),$10}' \
+                    | sed --expression='s/^\/archive\/'${GROUP:0:1}'\/'$GROUP'\/'$USER'\///' \
+                    > $tmpfile2
+            fi
+            #to save time, we will add stubs for any directories that were requested,
+            #and ask that the connexion check is omitted
+            if [ -n "$1" ]; then
+                dir=$(ish_normalize $1)/
+                while [[ "$dir" =~ \/ ]]
+                do
+                    dir="${dir%/*}"
+                    echo "$dir/$ISH_SEP---------- $(id -nu)/$(id -ng)  0 ---------- --------" >> $tmpfile2
+                done
+            fi
+            ISH_SKIP_CXC=true ish_create_igz $idxfile $tmpfile2 "hindex $@"
+            local status=$?
+            rm --force $tmpfile2
+        fi
+        rm --force $tmpfile
+        if [ $status == 0 ]; then
+            command_use "$idxfile"
+            status=$?
+        fi
+        if [ "$ISH_STAGE" == "2" ]; then
+            rm --force $idxfile-stage1 
+        fi
+        return $status
+        ;;
+    esac
+}
+
+function command_htar() {
+    # Htar and make index for a directory.
+    #   $1    = flags given to tar in addition to -cf (with dashes)
+    #   $2    = tarball name
+    #   $3... = file pattern(s) to tar up
+    # Will create the tarball and a <tarball>.idx on the hpss system.
+    # Local index file stored in $2.igz
+    if (( $# < 2 )); then
+        stderr "Error: not enough arguments for htar" 
+        return $ISH_SYNTAX
+    fi
+    if $ISH_DRY; then 
+        echo "$HTAR $@" >> "$ISH_SCRIPT"
+        return 0
+    fi
+    if ! which $HTAR >&/dev/null; then
+        stderr "This command requires $HTAR. Cannot find $HTAR." 
+        return 127
+    fi
+    # build the flags, such that -c and -f are always there even if
+    # not given explicitly.
+    local flags=
+    if [[ "${1:0:1}" == "-" ]]; then
+        flags="$1"
+        if ! [[ "$flags" =~ [Acdtrux] ]]; then
+            flags="-c $flags"
+        fi
+        if ! [[ "$flags" =~ f$ ]]; then
+            flags="$flags"f
+        fi
+        shift
+    else
+        flags="-cf"
+        if [ -z "$1" ]; then
+            shift
+        fi
+    fi
+    if [ -z "$1" ]; then
+        echo "No htarball specified."
+        return $ISH_SYNTAX    
+    else
+        local tarname="$1"
+        shift    
+        if $HTAR $flags "$tarname" $* ; then
+            ISH_COMMENT="(from ish htar)" command_hindex "$tarname" 
+        else
+            return $?
+        fi
+    fi
+}
+
+function command_index() {
+    # Makes an index file of a directory tree or an existing tarball.
+    #   $1  The name of the directory or of the tarball
+    # Result in file $1.igz
+    if (( $# != 1 )); then
+        stderr "Error: index needs a directory or a tarball as a parameter" 
+        return $ISH_SYNTAX
+    fi
+    local tmpfile=$(mktemp)
+    local arg=${1%%/} # removes any tailing '/'
+    local idxfile=
+    local status=0
+    if [ -d "$arg" ]; then
+        if [ "$ISH_REG" == "." ]; then
+            #current directory: relatively simple name
+            idxfile="$(ish_normalize $arg).igz" 
+            idxfile="${idxfile//\//_}"
+            echo $idxfile
+        else
+            #igz not in current dir: name based on full path
+            idxfile="$(ish_normalize $(ish_full_path $arg)).igz" 
+            idxfile="$ISH_REG/${idxfile//\//_}"
+        fi
+        ish_dir_list "$arg" > $tmpfile
+        status=$?
+        if [ $status == 0 ]; then
+            local tmpfile2=$(mktemp)
+            sed --expression='s/^\.\///' $tmpfile > "$tmpfile2"
+            ish_create_igz $idxfile $tmpfile2 "index $@"
+            status=$?
+            rm --force $tmpfile2
+        fi        
+    elif [ -f "$arg" ]; then
+        idxfile="$(ish_normalize $arg).igz" 
+        idxfile="$ISH_REG/${idxfile//\//_}"
+        if tar -tvf "$1" > $tmpfile; then
+            local tmpfile2=$(mktemp)
+            sed --expression='s/ -> .*//' "$tmpfile" \
+                | awk '{printf "%s'$ISH_SEP'", $6;sub($6,"");print}' \
+                | sed --expression='s/^\.\///' \
+                > "$tmpfile2"
+            ish_create_igz $idxfile $tmpfile2 "index $@"
+            rm --force "$tmpfile2"
+        else
+            echo "Could not read tarball $1"
+        fi
+    else
+        echo "$1 is neither a directory nor a tarball"
+        status=72
+    fi
+    rm --force $tmpfile
+    if [ "$status" == "0" ]; then
+        command_use "$idxfile"
+        status=$?
+    fi
+    return $status
+}
+
+function command_du() {
+    # Print total number of kilobytes in current directory in index file
+    echo "kB	files	directory name"
+    echo "-------------------------------"
+    if (( $# == 2 )); then
+        if [ "$1" != "-r" ]; then
+            stderr "Syntax error: usage should be 'du <dir>' or 'du -r <dir>'"
+            return $ISH_SYNTAX
+        else
+            ISH_COUNT=0
+            ISH_RECUR=true ish_du "$2"
+        fi       
+    elif (( $# == 0 )); then
+        ISH_COUNT=0
+        ISH_RECUR=false ish_du .
+    elif (( $# != 1 )); then
+        stderr "Syntax error: du takes at most one argument"
+        return $ISH_SYNTAX
+    else
+        if [ "$1" == "-r" ]; then
+            ISH_COUNT=0
+            ISH_RECUR=true ish_du .
+        else
+            ish_du $1
+        fi
+    fi
+    echo "-------------------------------"
+    echo "Total $ISH_LAST_SUM bytes, $ISH_LAST_NF files, $ISH_COUNT directories"
+}
+
+function command_info() {
+    # Print properties of the current index file
+    if (( $# != 0 )); then
+        stderr "Syntax error: info does not takes any arguments"
+        return $ISH_SYNTAX
+    fi
+    echo "    ish version       $(ish_extract VERSION) ($(ish_extract MODIFIED))"
+    echo "    register          $ISH_REG/"
+    echo "    using             $(ish_normalize ${ISH_FILE#$ISH_REG/*})"
+    if [ -n "$ISH_FILE" ]; then
+        echo "    igz:"
+        echo "     date             $(ish_igz_extract DATESTAMP)"
+        local pwd=$(ish_igz_extract PWD)
+        echo "     pwd              ${pwd//&//}"
+        local cmd=$(ish_igz_extract CMD)
+        echo "     created with     ${cmd//&//}"
+        echo "     created by       $(ish_igz_extract USER)"
+        echo "     created on       $(ish_igz_extract HOST)"
+        echo "     with ish version $(ish_igz_extract VERSION)"
+    fi
+}
+
+function command_lls() {
+    # List local files
+    #   $* the arguments to ls
+    local tmpfile=$(mktemp)
+    ls --color=none -p $@ > $tmpfile
+    ish_colourize $tmpfile
+    rm --force $tmpfile
+}
+
+function command_pindex() {
+    # Makes an index file of purge list
+    #   $1  The name of the purge list
+    # Result in file $1.igz, without underscores
+    if (( $# > 1 )); then
+        stderr "Error: pindex only needs the filename of a purgelist as a parameter" 
+        return $ISH_SYNTAX
+    fi
+    local purgefile="${1:-/scratch/t/todelete/current/???????$(id -un)*}"
+    local idxfile=
+    local status=0
+    if [ -f $purgefile ]; then        
+        idxfile="$(ish_normalize $purgefile).igz" 
+        idxfile="${idxfile//_/}"
+        idxfile="$ISH_REG/${idxfile//\//_}"
+        local tmpfile=$(mktemp)
+        ish_purge_list $purgefile > $tmpfile
+        local newstatus=$?
+        if (( $newstatus > $status )); then
+            status=$newstatus
+        fi
+        dir=$SCRATCH
+        echo "$dir/$ISH_SEP---------- $(id -nu)/$(id -ng)  0 ---------- --------" >> $tmpfile
+        while [[ "$dir" =~ \/ ]]
+        do
+            dir="${dir%/*}"
+            echo "$dir/$ISH_SEP---------- $(id -nu)/$(id -ng)  0 ---------- --------" >> $tmpfile
+        done
+#        ISH_SKIP_CXC=true ish_create_igz $idxfile $tmpfile "pindex $@"
+        ISH_SKIP_CXC=false ish_create_igz $idxfile $tmpfile "pindex $@"
+        newstatus=$?
+        if (( $newstatus > $status )); then
+            status=$newstatus
+        fi
+        rm --force $tmpfile
+    else
+        echo "$purgefile does not exist"
+        status=72
+    fi
+    if [ "$status" == "0" ]; then
+        command_use "$idxfile"
+        status=$?
+    fi
+    return $status
+}
+
+function command_register() { 
+    # Sets root directory where to store index files
+    #   $1 = directory to be used as register
+    if (( $# > 1 )); then
+        stderr "Error: use takes at most one argument"
+        return $ISH_SYNTAX
+    fi
+    if [ -z "$1" ]; then
+        if [ -n "${ISHREGISTER:-}" ]; then
+            ISH_REG="$ISHREGISTER"
+        else
+            ISH_REG="$HOME/.ish_register"
+        fi
+    elif [[ "$1" == "." || "$1" == "./" ]]; then
+        ISH_REG="."
+    else
+        local idxpath1=$(ish_full_path "$1")
+        local idxpath2='/'$(ish_normalize "${idxpath1:1}")
+        if ! [ -e "$idxpath2" ]; then
+            mkdir -p "$idxpath2"
+        fi
+        if [ -d "$idxpath2" ]; then
+            ISH_REG="$idxpath2"
+        else
+            stderr "Cannot find directory $idxpath2"
+            return 72
+        fi
+    fi
+}
+
+function command_settings() {
+    # Print hidden and non-hidden settings
+    if (( $# != 0 )); then
+        stderr "Syntax error: 'settings' does not take any arguments"
+        return $ISH_SYNTAX
+    fi
+    echo "    register         $ISH_REG/"
+    echo "    using            $(ish_normalize ${ISH_FILE#$ISH_REG/*})"
+    echo "    colour           $ISH_COLOUR"
+    echo "    scripting        $ISH_DRY"
+    echo "    use history"
+    local i
+    for ((i=1;i<$ISH_STACK;i++))
+    do
+        echo ${ISH_IGZSTACK[${i}]}
+    done
+}
+
+function command_tar() {
+    # Tar and make index for a directory.
+    #   $1    = flags given to tar in addition to -cf (with dashes)
+    #   $2    = tarball name
+    #   $3... = file pattern(s) to tar up
+    # Result in $2.igz
+    if (( $# < 2 )); then
+        stderr "Error: not enough arguments for tar" 
+        return $ISH_SYNTAX
+    fi
+    local flags=
+    if [[ "${1:0:1}" == "-" ]]; then
+        flags="$1"
+        if ! [[ "$flags" =~ [Acdtrux] ]]; then
+            flags="-c $flags"
+        fi
+        if ! [[ "$flags" =~ f$ ]]; then
+            flags="$flags"f
+        fi
+        shift
+    else
+        flags="-cf"
+        if [ -z "$1" ]; then
+            shift
+        fi
+    fi
+    if [ -z "$1" ]; then
+        echo "No tarball specified."
+        return $ISH_SYNTAX    
+    else
+        local tarname="$1"
+        shift    
+        if tar $flags "$tarname" $*; then
+            command_index "$tarname"
+        else
+            return $?
+        fi
+    fi
+}
+
+function command_use() { 
+    ISH_IGZSTACK[$ISH_STACK]="$ISH_FILE $ISH_PWD"
+    let ISH_STACK++
+    ish_use $1
+}
+
+function command_unuse() { 
+    if (( "$ISH_STACK" > 1 )); then
+        let ISH_STACK--
+        set -- ${ISH_IGZSTACK[ISH_STACK]}
+        ish_use $1
+        command_cd $2
+    else
+        echo "Cannot unuse first used index file."
+    fi
+}
+
+# main is about to be called, but first we detect and set a few things
+if [ -n "${ISHREGISTER:-}" ]; then
+    ISH_REG=$ISHREGISTER
+fi
+# check if ~/.ish_register should be created
+if [ "$ISH_REG" == "~/.ish_register" ]; then
+    mkdir -p ~/.ish_register
+    true
+fi
+# Check if column command is available
+if which column >&/dev/null; then
+    ISH_COLUMN=column
+fi
+# Normalize the path to this ish
+ISH="$(ish_normalize $(ish_full_path $0))" 
+#echo $ISH
+
+main "$@"
+
