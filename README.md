@@ -19,8 +19,8 @@ Installation
 ============
 
 Ish is written in bash and will thus need a relative recent version of
-bash.  Copying the script called "ish" to a location in your PATH will
-be enough to install it.
+bash.  Copying the script called "ish" to a location in your PATH, and 
+setting its execution bit (chmod +x ish) should be enough to install it.
 
 Ish has been tested with bash version 4.1.2, and some earlier
 versions.  Bash version 3.2.16 is known to have some issues with parts
