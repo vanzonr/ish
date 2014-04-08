@@ -1,10 +1,8 @@
 ish
 ===
 
-inventory shell to browse files offline using unix-like commands
+Inventory shell to browse files offline using unix-like commands
 
-ish - inventory shell to browse files offline using unix-like commands
-=======================================================================
 
 Ish is a bash script that presents a shell to the user to create and
 access inventory files (or index files) that contain a list of file
