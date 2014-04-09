@@ -11,6 +11,10 @@ unix-like shell.  The intended use of ish is to keep track of data
 stored at various locations and files systems.  The current version
 of ish is 0.997.
 
+Ish originated out of a need to keep track of files stored on IBM's 
+'High Performance Storage System', or HPSS.  It still has a number 
+of hpss targeted functionality, but can be used separate from HPSS.
+
 ish is open-source, and is released under the MIT license. This
 library is distributed WITHOUT ANY WARRANTY. For details, see the file
 named 'LICENSE', and license statements in the source files.
