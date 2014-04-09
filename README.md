@@ -13,7 +13,11 @@ of ish is 0.997.
 
 Ish originated out of a need to keep track of files stored on IBM's 
 'High Performance Storage System', or HPSS.  It still has a number 
-of hpss targeted functionality, but can be used separate from HPSS.
+of hpss targeted functionality when it comes to building inventory 
+files, which require the hsi and htar programs by Gleicher 
+Enterprises.  
+
+Despite this, ish can be used separate from HPSS. 
 
 ish is open-source, and is released under the MIT license. This
 library is distributed WITHOUT ANY WARRANTY. For details, see the file
