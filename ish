@@ -1882,9 +1882,12 @@ function command_pindex() {
         stderr "Error: pindex only needs the filename of a purgelist as a parameter" 
         return $ISH_SYNTAX
     fi
-    local purgefile="${1:-/scratch/t/todelete/current/???????$(id -un)*}"
     local idxfile=
     local status=0
+    local purgefile="${1:-/scratch/t/todelete/current/???????$(id -un)*}"
+    if ! [ -f $purgefile ]; then
+        purgefile="${1:-/scratch/t/todelete/current/?????????$(id -un)*}"
+    fi
     if [ -f $purgefile ]; then        
         idxfile="$(ish_normalize $purgefile).igz" 
         idxfile="${idxfile//_/}"
