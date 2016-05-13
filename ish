@@ -3,7 +3,7 @@
 # ish - Inventory shell to browse folders, tarball content, ..., from
 #       local index files; written in bash.
 #
-# Copyright (c)  2011-2014  Ramses van Zon
+# Copyright (c)  2011-2016  Ramses van Zon
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -28,8 +28,8 @@
 #      AUTHOR: Ramses van Zon
 # AFFILIATION: SciNet/Toronto/Canada
 #     CREATED: June 8, 2011
-#     VERSION: 0.997
-#    MODIFIED: Apr 8, 2014
+#     VERSION: 0.998
+#    MODIFIED: May 13, 2016
 #     PURPOSE: Browse folders, tarball content, ... from local index files.
 #       USAGE: See the functions ish_usage and command_help below.
 ############################################################################
@@ -1542,7 +1542,7 @@ function command_hindex() {
                 return 127
             fi
             local lsout
-            lsout="$($HSI -q ls -l "$1" 2>&1)"
+            lsout="$($HSI -q ls -l "$1" 2>&1 | tail -1)"
             local status=$?
             if [ "$status" != "0" ]; then
                 ish_err_msg $status hsi
