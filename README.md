@@ -9,7 +9,7 @@ access inventory files (or index files) that contain a list of file
 with meta data (date, size, etc.).  The access mimics aspects of a
 unix-like shell.  The intended use of ish is to keep track of data
 stored at various locations and files systems.  The current version
-of ish is 0.997.
+of ish is 0.998.
 
 Ish originated out of a need to keep track of files stored on IBM's 
 'High Performance Storage System', or HPSS.  It still has a number 
@@ -34,7 +34,7 @@ Ish has been tested with bash version 4.1.2, and some earlier
 versions.  Bash version 3.2.16 is known to have some issues with parts
 of the script.  A number of utilities such as zgrep, zdiff, tar,... 
 are also needed.  Apologies for there not being an exhaustive list
-of prerequisites yet; this one reason why this is still version 0.997.
+of prerequisites yet; this one reason why this is still version 0.998.
 
 Documentation
 =============
@@ -52,8 +52,8 @@ Reporting Bugs
 
 Under the license, you are not required to report bugs, but are
 encouraged to do so.  If you find a bug, you may report it to
-rzon@scinethpc.ca or vanzonr@gmail.com. Errors or omissions in the
-help can be reported to the same address.
+rzon@scinet.utoronto.ca or vanzonr@gmail.com. Errors or omissions in
+the help can be reported to the same address.
 
 Files
 =====
@@ -68,4 +68,4 @@ AUTHOR:             Name and email address of the author
 
 README.md:          This file
 
-- 8 April 2014 
+- 8 April 2014 / updated 13 May 2016
