@@ -1674,7 +1674,7 @@ function command_hindex() {
                       --expression='s/^UNKNOWN.\(.*\)$/\1 0 x x x x x x x -------- ----------/' \
                       --expression='s/^FILE.\([^ \t]*\)\s/\1 /' \
                     | awk '{print $1 "'$ISH_SEP'----------","'"$(id -un)/$(id -gn)"'",$2,substr($11,7,4) "-" substr($11,1,2) "-" substr($11,4,2),$10}' \
-                    | sed --expression='s/^\/archive\/'${GROUP:0:1}'\/'$GROUP'\/'$USER'\///' \
+                    | sed --expression='s/^'${ARCHIVE////\\/}'\///' \
                     > $tmpfile2
             fi
             #to save time, we will add stubs for any directories that were requested,
